@@ -21,3 +21,11 @@ Filecoin network. See [Claiming documentation](https://docs.zerolabs.green/zerol
 ```shell
 npm run script
 ```
+
+### Warning
+
+Currently, the only claims data that can be decoded are the ones from certificates collections 1 & 2. However, those collections
+are not associated to any batch, thus not appearing in CSV.
+
+Even for decoded collections we can only retrieve claim data that makes little sense. Feel free to consult [src/claims.csv](./src/claims.csv)
+for more information.
