@@ -67,7 +67,7 @@ type Claim = {
 
 type Agreement = {
     agreementAddress: string;
-    certificateId: string;
+    certificateIds: string[];
     signedAmount: string;
     filledAmount: string;
     buyer: string;
@@ -350,7 +350,8 @@ const parseEwcData = async () => {
         if (!valid) {
             continue;
         }
-
+        const certificateIds: string[] = [];
+        const filledAmount: BigNumber = BigNumber.from(0);
         for (const agreementFilledEvent of agreementFilledEvents) {
             const {
                 agreementAddress: agreementFilledAddress,
@@ -360,20 +361,22 @@ const parseEwcData = async () => {
 
             if (agreementSignedAddress === agreementFilledAddress) {
                 certificatesInAgreement[certificateId.toString()] = true;
-                agreements.push({
-                    agreementAddress: agreementSignedAddress,
-                    certificateId: certificateId.toString(),
-                    signedAmount: agreementSignedAmount.toString(),
-                    filledAmount: agreementFilledAmount.toString(),
-                    buyer,
-                    seller,
-                    metadata,
-                    metadataDecoded: JSON.stringify(
-                        AgreementMetadataCoder.decode(metadata),
-                    ),
-                });
+                certificateIds.push(certificateId.toString());
+                filledAmount.add(agreementFilledAmount);
             }
         }
+        agreements.push({
+            agreementAddress: agreementSignedAddress,
+            certificateIds,
+            signedAmount: agreementSignedAmount.toString(),
+            filledAmount: filledAmount.toString(),
+            buyer,
+            seller,
+            metadata,
+            metadataDecoded: JSON.stringify(
+                AgreementMetadataCoder.decode(metadata),
+            ),
+        });
     }
 
     // Iterate through all redemption statement on-chain. Sorting by block number to tackle oldest to most recent.
