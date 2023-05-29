@@ -1,11 +1,12 @@
-import { BigNumber, BytesLike, constants, ethers } from 'ethers';
+import { BigNumber, constants, ethers } from 'ethers';
 import Papa from 'papaparse';
 import fs from 'fs';
 
 import registryExtendedConfig from './registry-extended';
 import batchFactoryConfig from './batch-factory';
+import agreementFactoryConfig from './agreement-factory';
 import path from 'path';
-import { defaultAbiCoder } from 'ethers/lib/utils';
+import { ClaimDataCoder } from '@zero-labs/tokenization-contracts';
 
 /*
  * Energy Web Chain intersected data
@@ -16,35 +17,59 @@ type BatchRegistry = {
 };
 
 type Batch = {
-    id: string;
+    // Unique ID associated to a batch.
     batchId: string;
+    // Redemption statement set for the batch.
     redemptionStatement: string;
+    // URL pointing to the redemption statement PDF.
     storagePointer: string;
+    // Certificates IDs related to the batch.
     certificateIds: string[];
+    // Transaction hash at which the corresponding event was emitted.
     transactionHash: string;
 };
 
 type Certificate = {
-    id: string;
+    // Token ID generated on chain.
     tokenId: string;
+    // Batch ID to which this certificate is related.
+    batchId: string;
+    // Amount of RECs associated to this certificate.
     value: string;
     operator: string;
     from: string;
     to: string;
-    claimIds: string[];
+    // Transaction hash at which the corresponding event was emitted.
     transactionHash: string;
 };
 
 type Claim = {
-    id: string;
+    // Certificate ID that was subject of a claim.
+    tokenId: string;
+    // EW address.
     claimIssuer: string;
+    // SP address that claimed the RECs.
     claimSubject: string;
+    // ?
     topic: string;
-    certificateId: string;
+    // Amount of RECs claimed.
     value: string;
+    // Metadata associated to the claim.
     claimData: string;
+    // Decoded claim data.
     claimDataDecoded: string;
+    // Transaction hash at which the corresponding event was emitted.
     transactionHash: string;
+};
+
+type Agreement = {
+    agreementAddress: string;
+    certificateId: string;
+    amount: string;
+    buyer: string;
+    seller: string;
+    metadata: string;
+    metadataDecoded: string;
 };
 
 /*
@@ -79,22 +104,40 @@ type ClaimSingleArgs = {
     _claimData: string;
 };
 
-type ClaimData = {
-    beneficiary: string;
-    region: string;
-    countryCode: string;
-    periodStartDate: string;
-    periodEndDate: string;
-    purpose: string;
-    consumptionEntityID: string;
-    proofID: string;
-    location: string;
+type AgreementFilledArgs = {
+    agreementAddress: string;
+    certificateId: BigNumber;
+    amount: BigNumber;
 };
 
+type AgreementSignedArgs = {
+    agreementAddress: string;
+    buyer: string;
+    seller: string;
+    amount: BigNumber;
+};
+type AgreementsDeployedArgs = {
+    agreements: string[];
+};
+
+type AgreementData = {
+    buyer: string;
+    seller: string;
+    amount: BigNumber;
+    metadata: string;
+    valid: boolean;
+};
+
+const AGREEMENTS_DATA_CACHE = path.resolve(
+    __dirname,
+    './cache/agreements-data-cache.csv',
+);
 export const getEwfContractsInstances = () => {
     const registryExtendedAddress =
         '0x5651a7A38753A9692B7740CCeCA3824a4d33aEFb';
     const batchFactoryAddress = '0x2248a8e53c8cf533aeef2369fff9dc8c036c8900';
+    const agreementFactoryAddress =
+        '0x5fd92584ceF267a7b702c722C660bF9C4ed2bfA7';
     const ewfProvider = ethers.getDefaultProvider('https://rpc.energyweb.org');
 
     return {
@@ -108,19 +151,107 @@ export const getEwfContractsInstances = () => {
             batchFactoryConfig.abi,
             ewfProvider,
         ),
+        agreementFactoryContract: new ethers.Contract(
+            agreementFactoryAddress,
+            agreementFactoryConfig.abi,
+            ewfProvider,
+        ),
     };
 };
-
-let claimsDecoded = 0;
-// TODO COUNT CLAIMS DECODED PRINT IT ANS STORE WHAT WAS FOUND
 
 const parseEwcData = async () => {
     console.info(
         `Starting process to fetch and parse data from Energy Web Chain...\n`,
     );
 
-    const { registryExtendedContract, batchFactoryContract } =
-        getEwfContractsInstances();
+    const {
+        registryExtendedContract,
+        batchFactoryContract,
+        agreementFactoryContract,
+    } = getEwfContractsInstances();
+
+    console.info(`\tAGREEMENTS\n`);
+
+    const agreementDeployedEvents = await agreementFactoryContract.queryFilter(
+        agreementFactoryContract.filters.AgreementsDeployed(),
+    );
+    let nbrAgreementsDeployed = 0;
+    agreementDeployedEvents.forEach(e => {
+        const { agreements } = e.args as unknown as AgreementsDeployedArgs;
+        nbrAgreementsDeployed += agreements.length;
+    });
+
+    console.info(`\t\tFound ${nbrAgreementsDeployed} deployed agreements\n`);
+
+    const agreementSignedEvents = await agreementFactoryContract.queryFilter(
+        agreementFactoryContract.filters.AgreementSigned(),
+    );
+
+    console.info(
+        `\t\tFound ${agreementSignedEvents.length} signed agreements\n`,
+    );
+
+    // Setup and maintain cache.
+    console.info(`\t\tUpdating agreements data cache\n`);
+
+    const stream = fs.createWriteStream(AGREEMENTS_DATA_CACHE, { flags: 'a' });
+
+    stream.write(`blockId,address,buyer,seller,amount,metadata,valid\n`);
+
+    const agreementsData: { [key: string]: AgreementData } = {};
+    // Iterate through all signed agreements to get metadata.
+    for (const agreementSignedEvent of agreementSignedEvents.sort(
+        (a, b) => a.blockNumber - b.blockNumber,
+    )) {
+        const { agreementAddress } =
+            agreementSignedEvent.args as unknown as AgreementSignedArgs;
+
+        const agreementData = await agreementFactoryContract.agreementData(
+            agreementAddress,
+        );
+
+        agreementsData[agreementAddress] = {
+            buyer: agreementData.buyer,
+            seller: agreementData.seller,
+            amount: agreementData.amount,
+            metadata: agreementData.metadata,
+            valid: agreementData.valid,
+        };
+
+        stream.write(
+            `${agreementSignedEvent.blockNumber},${agreementAddress},${
+                agreementData.buyer
+            },${agreementData.seller},${agreementData.amount.toString()},${
+                agreementData.metadata
+            },${agreementData.valid}\n`,
+        );
+
+        console.info(
+            `\t\t\tAgreement data added to cache for agreement: ${agreementAddress}\n`,
+        );
+    }
+
+    stream.end();
+
+    console.info(`\t\tCache updated!\n`);
+
+    const agreementFilledEvents = await agreementFactoryContract.queryFilter(
+        agreementFactoryContract.filters.AgreementFilled(),
+    );
+
+    console.info(
+        `\t\tFound ${agreementFilledEvents.length} filled agreements\n`,
+    );
+
+    const agreementClaimedEvents = await agreementFactoryContract.queryFilter(
+        agreementFactoryContract.filters.AgreementClaimed(),
+    );
+
+    console.info(
+        `\t\tFound ${agreementClaimedEvents.length} claimed agreements\n`,
+    );
+
+    console.info(`\tCERTIFICATES\n`);
 
     const mintEvents = await registryExtendedContract.queryFilter(
         registryExtendedContract.filters.TransferSingle(
@@ -129,12 +260,14 @@ const parseEwcData = async () => {
         ),
     );
 
+    console.info(`\t\tFound ${mintEvents.length} certificates minted\n`);
+
     const redemptionSetEvents = await batchFactoryContract.queryFilter(
         batchFactoryContract.filters.RedemptionStatementSet(),
     );
 
     console.info(
-        `\tFound ${redemptionSetEvents.length} redemption statement set on batches\n`,
+        `\t\tFound ${redemptionSetEvents.length} redemption statement set on batches\n`,
     );
 
     const certificateBatchMintedEvents = await batchFactoryContract.queryFilter(
@@ -142,18 +275,68 @@ const parseEwcData = async () => {
     );
 
     console.info(
-        `\tFound ${certificateBatchMintedEvents.length} certificates minted\n`,
+        `\t\tFound ${certificateBatchMintedEvents.length} batch linked to certificates IDs\n`,
     );
 
     const claimSingleEvents = await registryExtendedContract.queryFilter(
         registryExtendedContract.filters.ClaimSingle(),
     );
 
-    console.info(`\tFound ${claimSingleEvents.length} claims\n\n`);
+    console.info(`\t\tFound ${claimSingleEvents.length} claims\n\n`);
 
     const batches: Batch[] = [];
     const certificates: Certificate[] = [];
     const claims: Claim[] = [];
+    const agreements: Agreement[] = [];
+
+    // Iterate through all signed agreements
+    for (const agreementSignedEvent of agreementSignedEvents.sort(
+        (a, b) => a.blockNumber - b.blockNumber,
+    )) {
+        const {
+            agreementAddress: agreementSignedAddress,
+            buyer,
+            seller,
+            amount: agreementSignedAmount,
+        } = agreementSignedEvent.args as unknown as AgreementSignedArgs;
+
+        const { metadata, valid } = agreementsData[agreementSignedAddress];
+
+        if (!valid) {
+            continue;
+        }
+
+        for (const agreementFilledEvent of agreementFilledEvents) {
+            const {
+                agreementAddress: agreementFilledAddress,
+                certificateId,
+                amount: agreementFilledAmount,
+            } = agreementSignedEvent.args as unknown as AgreementFilledArgs;
+
+            if (agreementSignedAddress === agreementFilledAddress) {
+                if (
+                    agreementSignedAmount.toString() !==
+                    agreementFilledAmount.toString()
+                ) {
+                    console.log(
+                        '----------------------Different amount signed and filled------------------------',
+                    );
+                    console.log('Agreement address: ', agreementSignedAddress);
+                    console.log(
+                        'agreementSignedAmount',
+                        agreementSignedAmount.toString(),
+                    );
+                    console.log(
+                        'agreementFilledAddress',
+                        agreementFilledAddress.toString(),
+                    );
+                    console.log(
+                        '--------------------------------------------------------------------------------',
+                    );
+                }
+            }
+        }
+    }
 
     // Iterate through all redemption statement on-chain. Sorting by block number to tackle oldest to most recent.
     for (const redemptionSetEvent of redemptionSetEvents.sort(
@@ -189,8 +372,6 @@ const parseEwcData = async () => {
                         } = mintEvent.args as unknown as MintedArgs;
 
                         if (mintEventCertificateId.eq(certificateId)) {
-                            // Temporary buffer for claims related to certificate ID.
-                            const claimIds: string[] = [];
                             // Looking for claim events concerning the certificate ID we are iterating over.
                             for (const claimSingleEvent of claimSingleEvents) {
                                 const {
@@ -203,23 +384,13 @@ const parseEwcData = async () => {
                                 } = claimSingleEvent.args as unknown as ClaimSingleArgs;
                                 if (id.eq(certificateId)) {
                                     let claimDataDecoded =
-                                        decodeClaimV3(claimData);
-                                    if (!claimDataDecoded) {
-                                        claimDataDecoded =
-                                            decodeClaimV1(claimData);
-                                    }
-                                    if (!claimDataDecoded) {
-                                        claimDataDecoded =
-                                            decodeClaimV2(claimData);
-                                    }
+                                        ClaimDataCoder.decode(claimData);
 
-                                    claimIds.push(claims.length.toString());
                                     claims.push({
-                                        id: claims.length.toString(),
+                                        tokenId: id.toString(),
                                         claimIssuer,
                                         claimSubject,
                                         topic: topic.toString(),
-                                        certificateId: id.toString(),
                                         value: value.toString(),
                                         claimData: claimData.toString(),
                                         claimDataDecoded:
@@ -233,13 +404,12 @@ const parseEwcData = async () => {
                                 certificates.length.toString(),
                             );
                             certificates.push({
-                                id: certificates.length.toString(),
                                 tokenId: certificateId.toString(),
+                                batchId: certificateBatchMintedEventBatchId,
                                 value: mintedValue.toString(),
                                 operator,
                                 from,
                                 to,
-                                claimIds,
                                 transactionHash: mintEvent.transactionHash,
                             });
                         }
@@ -249,7 +419,6 @@ const parseEwcData = async () => {
         }
 
         batches.push({
-            id: batches.length.toString(),
             batchId: redemptionSetEventBatchId,
             storagePointer,
             certificateIds: batchCertificateIds,
@@ -319,114 +488,6 @@ const parseEwcData = async () => {
     );
 };
 
-// Sourced from EW repository: https://github.com/energywebfoundation/origin/blob/dc4930d80d4703d22beee27acac42db9157e27c1/packages/traceability/issuer/src/blockchain-facade/CertificateUtils.ts#L43-L68
-const decodeClaimV1 = (data: BytesLike): ClaimData | null => {
-    try {
-        const [
-            beneficiary,
-            location,
-            countryCode,
-            periodStartDate,
-            periodEndDate,
-            purpose,
-        ] = defaultAbiCoder.decode(
-            ['string', 'string', 'string', 'string', 'string', 'string'],
-            data,
-        );
-
-        // If any field is undefined it means that we are not decoding over the proper data structure, so returning null
-        if (
-            beneficiary === undefined ||
-            location === undefined ||
-            countryCode === undefined ||
-            periodStartDate === undefined ||
-            periodEndDate === undefined ||
-            purpose === undefined
-        ) {
-            return null;
-        }
-
-        return {
-            beneficiary,
-            region: '',
-            countryCode,
-            periodStartDate,
-            periodEndDate,
-            purpose,
-            consumptionEntityID: '',
-            proofID: '',
-            location,
-        };
-    } catch {
-        return null;
-    }
-};
-
-// Sourced from EW repository: https://github.com/energywebfoundation/origin/blob/dc4930d80d4703d22beee27acac42db9157e27c1/packages/traceability/issuer/src/blockchain-facade/CertificateUtils.ts#L43-L68
-const decodeClaimV2 = (data: BytesLike) => {
-    try {
-        const [claimData] = defaultAbiCoder.decode(['string'], data);
-
-        return JSON.parse(claimData);
-    } catch {
-        return null;
-    }
-};
-
-// Sourced from messages sent to Moca
-const decodeClaimV3 = (data: BytesLike) => {
-    try {
-        const [
-            beneficiary,
-            region,
-            countryCode,
-            periodStartDate,
-            periodEndDate,
-            purpose,
-            consumptionEntityID,
-            proofID,
-        ] = defaultAbiCoder.decode(
-            [
-                'string',
-                'string',
-                'string',
-                'string',
-                'string',
-                'string',
-                'string',
-                'string',
-            ],
-            data,
-        );
-
-        if (
-            beneficiary === undefined ||
-            region === undefined ||
-            countryCode === undefined ||
-            periodStartDate === undefined ||
-            periodEndDate === undefined ||
-            purpose === undefined ||
-            consumptionEntityID === undefined ||
-            proofID === undefined
-        ) {
-            return null;
-        }
-
-        return {
-            beneficiary,
-            region,
-            countryCode,
-            periodStartDate,
-            periodEndDate,
-            purpose,
-            consumptionEntityID,
-            proofID,
-            location: '',
-        };
-    } catch {
-        return null;
-    }
-};
 parseEwcData().catch(err =>
     console.error(
         `Error while trying to parse Energy Web Chain data: ${err.message}`,

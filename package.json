@@ -18,6 +18,7 @@
     "typescript": "^5.0.4"
   },
   "dependencies": {
+    "@zero-labs/tokenization-contracts": "^1.0.3",
     "ethers": "^5.7.2",
     "papaparse": "^5.4.1"
   }
