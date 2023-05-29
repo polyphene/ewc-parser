@@ -6,7 +6,10 @@ import registryExtendedConfig from './registry-extended';
 import batchFactoryConfig from './batch-factory';
 import agreementFactoryConfig from './agreement-factory';
 import path from 'path';
-import { ClaimDataCoder } from '@zero-labs/tokenization-contracts';
+import {
+    AgreementMetadataCoder,
+    ClaimDataCoder,
+} from '@zero-labs/tokenization-contracts';
 
 /*
  * Energy Web Chain intersected data
@@ -65,7 +68,8 @@ type Claim = {
 type Agreement = {
     agreementAddress: string;
     certificateId: string;
-    amount: string;
+    signedAmount: string;
+    filledAmount: string;
     buyer: string;
     seller: string;
     metadata: string;
@@ -128,10 +132,17 @@ type AgreementData = {
     valid: boolean;
 };
 
+type AgreementDataCached = AgreementData & {
+    blockId: string;
+    address: string;
+    amount: string;
+};
+
 const AGREEMENTS_DATA_CACHE = path.resolve(
     __dirname,
     './cache/agreements-data-cache.csv',
 );
+
 export const getEwfContractsInstances = () => {
     const registryExtendedAddress =
         '0x5651a7A38753A9692B7740CCeCA3824a4d33aEFb';
@@ -194,15 +205,48 @@ const parseEwcData = async () => {
     // Setup and maintain cache.
     console.info(`\t\tUpdating agreements data cache\n`);
 
+    const agreementsData: { [key: string]: AgreementData } = {};
+    let latestBlockId = 0;
+    const existingCache = fs.existsSync(AGREEMENTS_DATA_CACHE);
+
+    if (existingCache) {
+        const file = fs.createReadStream(AGREEMENTS_DATA_CACHE);
+
+        await readCSV(
+            AGREEMENTS_DATA_CACHE,
+            function (result: Papa.ParseStepResult<AgreementDataCached>) {
+                if (!result.data.valid) {
+                    return;
+                }
+                agreementsData[result.data.address] = {
+                    buyer: result.data.buyer,
+                    seller: result.data.seller,
+                    amount: BigNumber.from(result.data.amount),
+                    metadata: result.data.metadata,
+                    valid: result.data.valid,
+                };
+
+                if (parseInt(result.data.blockId, 10) > latestBlockId) {
+                    latestBlockId = parseInt(result.data.blockId, 10);
+                }
+            },
+        );
+    }
+
     const stream = fs.createWriteStream(AGREEMENTS_DATA_CACHE, { flags: 'a' });
 
-    stream.write(`blockId,address,buyer,seller,amount,metadata,valid\n`);
+    if (!existingCache) {
+        stream.write(`blockId,address,buyer,seller,amount,metadata,valid\n`);
+    }
 
-    const agreementsData: { [key: string]: AgreementData } = {};
     // Iterate through all signed agreements to get metadata.
     for (const agreementSignedEvent of agreementSignedEvents.sort(
         (a, b) => a.blockNumber - b.blockNumber,
     )) {
+        if (agreementSignedEvent.blockNumber <= latestBlockId) {
+            continue;
+        }
+
         const { agreementAddress } =
             agreementSignedEvent.args as unknown as AgreementSignedArgs;
 
@@ -288,6 +332,7 @@ const parseEwcData = async () => {
     const certificates: Certificate[] = [];
     const claims: Claim[] = [];
     const agreements: Agreement[] = [];
+    const certificatesInAgreement: { [key: string]: boolean } = {};
 
     // Iterate through all signed agreements
     for (const agreementSignedEvent of agreementSignedEvents.sort(
@@ -311,29 +356,22 @@ const parseEwcData = async () => {
                 agreementAddress: agreementFilledAddress,
                 certificateId,
                 amount: agreementFilledAmount,
-            } = agreementSignedEvent.args as unknown as AgreementFilledArgs;
+            } = agreementFilledEvent.args as unknown as AgreementFilledArgs;
 
             if (agreementSignedAddress === agreementFilledAddress) {
-                if (
-                    agreementSignedAmount.toString() !==
-                    agreementFilledAmount.toString()
-                ) {
-                    console.log(
-                        '----------------------Different amount signed and filled------------------------',
-                    );
-                    console.log('Agreement address: ', agreementSignedAddress);
-                    console.log(
-                        'agreementSignedAmount',
-                        agreementSignedAmount.toString(),
-                    );
-                    console.log(
-                        'agreementFilledAddress',
-                        agreementFilledAddress.toString(),
-                    );
-                    console.log(
-                        '--------------------------------------------------------------------------------',
-                    );
-                }
+                certificatesInAgreement[certificateId.toString()] = true;
+                agreements.push({
+                    agreementAddress: agreementSignedAddress,
+                    certificateId: certificateId.toString(),
+                    signedAmount: agreementSignedAmount.toString(),
+                    filledAmount: agreementFilledAmount.toString(),
+                    buyer,
+                    seller,
+                    metadata,
+                    metadataDecoded: JSON.stringify(
+                        AgreementMetadataCoder.decode(metadata),
+                    ),
+                });
             }
         }
     }
@@ -361,6 +399,10 @@ const parseEwcData = async () => {
             ) {
                 // Iterate over all certificates IDs that are related to the current batch we are iterating over.
                 for (const certificateId of certificateIds) {
+                    // If no agreement contains certificate then it does not concern us.
+                    if (!certificatesInAgreement[certificateId.toString()]) {
+                        continue;
+                    }
                     // Looking for minting events concerning the certificate ID we are iterating over.
                     for (const mintEvent of mintEvents) {
                         const {
@@ -429,6 +471,26 @@ const parseEwcData = async () => {
 
     console.info(`Finished fetching and parsing data from Energy Web Chain\n`);
 
+    let agreementsValue = BigNumber.from(0);
+    agreements.forEach(
+        a =>
+            (agreementsValue = agreementsValue.add(
+                BigNumber.from(a.signedAmount),
+            )),
+    );
+    console.info(`\tAGREEMENT SIGNED VALUE: ${agreementsValue.toString()}\n`);
+
+    let agreementsFilledValue = BigNumber.from(0);
+    agreements.forEach(
+        a =>
+            (agreementsFilledValue = agreementsFilledValue.add(
+                BigNumber.from(a.filledAmount),
+            )),
+    );
+    console.info(
+        `\tAGREEMENT FILLED VALUE: ${agreementsFilledValue.toString()}\n`,
+    );
+
     let mintedValue = BigNumber.from(0);
     certificates.forEach(
         c => (mintedValue = mintedValue.add(BigNumber.from(c.value))),
@@ -439,10 +501,24 @@ const parseEwcData = async () => {
     claims.forEach(
         c => (claimedValue = claimedValue.add(BigNumber.from(c.value))),
     );
-    console.info(`\tMINTED VALUE: ${claimedValue.toString()}\n\n`);
+    console.info(`\tCLAIMED VALUE: ${claimedValue.toString()}\n\n`);
 
     console.info(
-        `Generating CSV files for batch, certificates and claims...\n`,
+        `Generating CSV files for agreements, batch, certificates and claims...\n`,
+    );
+
+    const agreementsCSV = Papa.unparse(agreements);
+    fs.writeFile(
+        path.resolve(__dirname, 'agreements.csv'),
+        agreementsCSV,
+        function (err) {
+            if (err) {
+                return console.error(
+                    `\tError while generating agreements CSV: ${err.message}\n`,
+                );
+            }
+            console.info('\tagreements.csv generated!\n');
+        },
     );
 
     const batchesCSV = Papa.unparse(batches);
@@ -486,6 +562,25 @@ const parseEwcData = async () => {
             console.info('\tclaims.csv generated!\n');
         },
     );
+};
+
+const readCSV = async (
+    filePath: string,
+    stepCallback: Function,
+): Promise<void> => {
+    const csvFile = fs.readFileSync(filePath);
+    const csvData = csvFile.toString();
+    return new Promise(resolve => {
+        Papa.parse(csvData, {
+            header: true,
+            step: function (result: Papa.ParseStepResult<AgreementDataCached>) {
+                stepCallback(result);
+            },
+            complete: results => {
+                resolve();
+            },
+        });
+    });
 };
 
 parseEwcData().catch(err =>
