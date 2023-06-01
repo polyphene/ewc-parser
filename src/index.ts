@@ -351,7 +351,7 @@ const parseEwcData = async () => {
             continue;
         }
         const certificateIds: string[] = [];
-        const filledAmount: BigNumber = BigNumber.from(0);
+        let filledAmount: BigNumber = BigNumber.from(0);
         for (const agreementFilledEvent of agreementFilledEvents) {
             const {
                 agreementAddress: agreementFilledAddress,
@@ -362,7 +362,8 @@ const parseEwcData = async () => {
             if (agreementSignedAddress === agreementFilledAddress) {
                 certificatesInAgreement[certificateId.toString()] = true;
                 certificateIds.push(certificateId.toString());
-                filledAmount.add(agreementFilledAmount);
+                console.log(agreementFilledAmount.toString());
+                filledAmount = filledAmount.add(agreementFilledAmount);
             }
         }
         agreements.push({
@@ -474,14 +475,16 @@ const parseEwcData = async () => {
 
     console.info(`Finished fetching and parsing data from Energy Web Chain\n`);
 
-    let agreementsValue = BigNumber.from(0);
+    let agreementsSignedValue = BigNumber.from(0);
     agreements.forEach(
         a =>
-            (agreementsValue = agreementsValue.add(
+            (agreementsSignedValue = agreementsSignedValue.add(
                 BigNumber.from(a.signedAmount),
             )),
     );
-    console.info(`\tAGREEMENT SIGNED VALUE: ${agreementsValue.toString()}\n`);
+    console.info(
+        `\tAGREEMENT SIGNED VALUE: ${agreementsSignedValue.toString()}\n`,
+    );
 
     let agreementsFilledValue = BigNumber.from(0);
     agreements.forEach(
