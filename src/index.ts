@@ -362,7 +362,6 @@ const parseEwcData = async () => {
             if (agreementSignedAddress === agreementFilledAddress) {
                 certificatesInAgreement[certificateId.toString()] = true;
                 certificateIds.push(certificateId.toString());
-                console.log(agreementFilledAmount.toString());
                 filledAmount = filledAmount.add(agreementFilledAmount);
             }
         }
